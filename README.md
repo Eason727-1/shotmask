@@ -71,3 +71,7 @@ python python/analyze.py 新截图.png
 - 附带的 `stb_image.h` / `stb_image_write.h` 来自
   [nothings/stb](https://github.com/nothings/stb)（public domain / MIT，
   文件头内有完整许可声明）
+
+## License
+
+[MIT](LICENSE) © 2026 [Eason727-1](https://github.com/Eason727-1)
