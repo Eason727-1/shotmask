@@ -101,14 +101,24 @@ def process(path, outdir, suffix="_masked", debug=False):
         if acc >= tot * 0.5:
             bgL = v
             break
-    content = ImageChops.lighter(
-        mx.point(lut(bgL + 32)),
-        sat.point(lut(30)))
-    # 宽松版内容判定：暗色头像（照片类）与背景区分度低，用它来框头像位置
-    content_av = ImageChops.lighter(
-        mx.point(lut(bgL + 12)),
-        sat.point(lut(15)))
-    print(f"\n=== {os.path.basename(path)}  {W}x{H}  bgL={bgL}")
+    # 主题自动检测：亮色主题下"内容比背景暗"，判定全部取反
+    LIGHT = bgL > 128
+    if LIGHT:
+        content = ImageChops.lighter(
+            mx.point(lut(bgL - 32, gt=False)),
+            sat.point(lut(30)))
+        content_av = ImageChops.lighter(
+            mx.point(lut(bgL - 12, gt=False)),
+            sat.point(lut(15)))
+    else:
+        content = ImageChops.lighter(
+            mx.point(lut(bgL + 32)),
+            sat.point(lut(30)))
+        # 宽松版内容判定：暗色头像（照片类）与背景区分度低，用它来框头像位置
+        content_av = ImageChops.lighter(
+            mx.point(lut(bgL + 12)),
+            sat.point(lut(15)))
+    print(f"\n=== {os.path.basename(path)}  {W}x{H}  bgL={bgL}  主题={'亮色' if LIGHT else '深色'}")
 
     jobs = []
 
@@ -142,6 +152,10 @@ def process(path, outdir, suffix="_masked", debug=False):
                 cur0 = prev = i
         blocks.append((cur0, prev))
         b0, b1 = max(blocks, key=lambda t: t[1] - t[0])
+        # 亮色主题的坑：导航栏底色会占满整条竖带 → 满宽块不是头像，排除
+        if b0 <= 2 and b1 >= len(cols) - 3:
+            print(f"  [跳过候选] y=({yy0},{yy1}) 占满整条竖带（导航栏底色）")
+            continue
         cx0, cx1 = sx0 + b0, sx0 + b1 + 1
         wd = cx1 - cx0
         if not (0.045 * W <= wd <= 0.22 * W):
@@ -174,25 +188,47 @@ def process(path, outdir, suffix="_masked", debug=False):
         if not idx:
             continue
         cx0, cx1 = tx0 + idx[0], tx0 + idx[-1] + 1
-        gray = (mb < 160) and (ms < 45)
+        if LIGHT:
+            # 亮色主题：名字(实测≈142)比正文(≈75)【亮】；
+            # 正文里的表情会拉高饱和度 → 用 sat/h 双保险排除
+            gray = (mb > 110) and (ms < 30) and (h <= 45)
+        else:
+            gray = (mb < 160) and (ms < 45)
         print(f"  文字行 y=({yy0},{yy1}) h={h} 亮度={mb:.0f} 饱和={ms:.0f}"
               f" -> {'打码' if gray else '跳过'}")
         if gray:
             jobs.append(((cx0 - 8, yy0 - 6, cx1 + 8, yy1 + 6), "text"))
 
-    # ---------- 3) 顶部标题栏（白色加粗字，含名字） ----------
-    hy0, hy1 = int(0.060 * H), int(0.102 * H)
+    # ---------- 3) 顶部标题栏（含名字） ----------
+    # 深色主题 = 白色加粗字；亮色主题 = 深色字（判定取反、范围放宽）
+    if LIGHT:
+        hy0, hy1 = int(0.055 * H), int(0.115 * H)
+        white = ImageChops.darker(mx.point(lut(110, gt=False)), sat.point(lut(60, gt=False)))
+    else:
+        hy0, hy1 = int(0.060 * H), int(0.102 * H)
+        white = ImageChops.darker(mx.point(lut(180)), sat.point(lut(60, gt=False)))
     hx0, hx1 = int(0.15 * W), int(0.90 * W)
-    white = ImageChops.darker(mx.point(lut(180)), sat.point(lut(60, gt=False)))
     rp = row_profile(white, (hx0, hy0, hx1, hy1))
-    cp = col_profile(white, (hx0, hy0, hx1, hy1))
     rows = [i for i, v in enumerate(rp) if v > 3]
-    cols = [i for i, v in enumerate(cp) if v > 2]
-    if rows and cols:
-        box = (hx0 + cols[0] - 8, hy0 + rows[0] - 6,
-               hx0 + cols[-1] + 9, hy0 + rows[-1] + 7)
-        jobs.append((box, "title"))
-        print(f"  标题打码 box={box}")
+    # 把连续的行分组：丢掉紧贴窗口顶部的一段（亮色主题里是状态栏药丸的底边），
+    # 再取第一段 = 标题行；其后的段（如日期）不打码
+    runs = []
+    for i in rows:
+        if runs and i - runs[-1][1] <= 2:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    if runs and runs[0][0] <= 2:
+        runs = runs[1:]
+    if runs:
+        r0, r1 = runs[0]
+        ryy0, ryy1 = hy0 + r0, hy0 + r1
+        cp = col_profile(white, (hx0, ryy0, hx1, ryy1 + 1))
+        cols = [i for i, v in enumerate(cp) if v > 2]
+        if cols:
+            box = (hx0 + cols[0] - 8, ryy0 - 6, hx0 + cols[-1] + 9, ryy1 + 7)
+            jobs.append((box, "title"))
+            print(f"  标题打码 box={box}")
 
     # ---------- 打码 ----------
     for box, kind in jobs:
