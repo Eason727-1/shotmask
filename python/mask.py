@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 mask.py — 聊天截图自动打码：抹掉头像 + 名字（纯 PIL 实现，不依赖 numpy）
-用法: python3 mask.py 图片1 图片2 ... [--outdir DIR] [--debug]
+用法: python3 mask.py 图片1 图片2 ... [--outdir DIR] [--debug] [--extra "x0,y0,x1,y1;..."]
 
+支持：QQ / 微信；深色 / 亮色主题自动检测。头像自动识别左列（对方）和右列（自己）。
 原理（无需 OCR）:
-  1) 头像 = 左侧固定列里的大块彩色区域（背景是纯深色，好区分）
-  2) 名字 = 内容区里的"灰色小字行"（聊天正文是白色，亮度不同）
-  3) 标题栏 = 顶部白色加粗文字行（里面也含名字）
+  1) 头像 = 左/右侧竖带里的大块"非背景"区域（近似正方形校验）
+  2) 名字 = 内容区里的"灰色小字行"（与正文亮度不同；居中灰字=时间戳，跳过）
+  3) 标题栏 = 顶部导航区的文字行（里面也含名字）
+  4) --extra 可手动指定额外打码框（如微信聊天记录卡片里的名字前缀）
 """
 import os
 import time
@@ -83,7 +85,7 @@ def lut(thr, gt=True):
 
 # ---------------- 主流程 ----------------
 
-def process(path, outdir, suffix="_masked", debug=False):
+def process(path, outdir, suffix="_masked", debug=False, extra=""):
     t0 = time.time()
     im = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
     W, H = im.size
@@ -161,12 +163,58 @@ def process(path, outdir, suffix="_masked", debug=False):
         if not (0.045 * W <= wd <= 0.22 * W):
             print(f"  [跳过候选] y=({yy0},{yy1}) x=({cx0},{cx1}) w={wd}")
             continue
+        hh = yy1 - yy0 + 1
+        # 头像应近似正方形：排除"383"角标（宽扁）和输入栏图标（窄长）
+        if not (0.72 <= wd / hh <= 1.40):
+            print(f"  [跳过候选] y=({yy0},{yy1}) {wd}x{hh} 长宽比不符")
+            continue
         avatars.append((cx0, yy0, cx1, yy1))
         jobs.append(((cx0 - 3, yy0 - 3, cx1 + 3, yy1 + 3), "avatar"))
         print(f"  头像 y=({yy0},{yy1}) h={yy1-yy0+1} x=({cx0},{cx1}) w={wd}")
+    left_x1 = max([a[2] for a in avatars], default=0)
+
+    # 右侧头像带（微信等：自己发的消息，头像在右边；逻辑与左侧镜像）
+    rx0, rx1 = int(0.860 * W), int(0.980 * W)
+    rprof = row_profile(content_av, (rx0, y0s, rx1, y1s))
+    for (a, b) in runs_of(rprof, 76):
+        h = b - a + 1
+        if h < int(0.020 * H) or h > int(0.13 * H):
+            continue
+        aa, bb = a, b
+        while aa - 1 >= 0 and rprof[aa - 1] > 30:
+            aa -= 1
+        while bb + 1 < len(rprof) and rprof[bb + 1] > 30:
+            bb += 1
+        yy0, yy1 = aa + y0s, bb + y0s
+        rcols = col_profile(content_av, (rx0, yy0, rx1, yy1 + 1))
+        ridx = [i for i, v in enumerate(rcols) if v > 127]
+        if not ridx:
+            continue
+        rblocks = []
+        cur0 = prev = ridx[0]
+        for i in ridx[1:]:
+            if i - prev <= 3:
+                prev = i
+            else:
+                rblocks.append((cur0, prev))
+                cur0 = prev = i
+        rblocks.append((cur0, prev))
+        rb0, rb1 = max(rblocks, key=lambda t: t[1] - t[0])
+        if rb0 <= 2 and rb1 >= len(rcols) - 3:
+            continue
+        cx0, cx1 = rx0 + rb0, rx0 + rb1 + 1
+        wd = cx1 - cx0
+        if not (0.045 * W <= wd <= 0.22 * W):
+            continue
+        hh = yy1 - yy0 + 1
+        if not (0.72 <= wd / hh <= 1.40):
+            continue
+        avatars.append((cx0, yy0, cx1, yy1))
+        jobs.append(((cx0 - 3, yy0 - 3, cx1 + 3, yy1 + 3), "avatar"))
+        print(f"  头像(右) y=({yy0},{yy1}) h={hh} x=({cx0},{cx1}) w={wd}")
 
     # ---------- 2) 名字 / 引用（内容区灰色小字） ----------
-    av_x1 = max([a[2] for a in avatars], default=0)
+    av_x1 = left_x1   # tx0 只看左侧头像（右侧头像在画面另一头，与文字区无关）
     tx0 = int(0.155 * W)
     if av_x1:
         tx0 = min(max(tx0, av_x1 + 2), int(0.175 * W))
@@ -188,6 +236,10 @@ def process(path, outdir, suffix="_masked", debug=False):
         if not idx:
             continue
         cx0, cx1 = tx0 + idx[0], tx0 + idx[-1] + 1
+        # 居中灰字（微信的时间戳、系统提示等）不打码
+        if cx0 >= 0.43 * W and cx1 <= 0.57 * W:
+            print(f"  文字行 y=({yy0},{yy1}) 居中（时间戳），跳过")
+            continue
         if LIGHT:
             # 亮色主题：名字(实测≈142)比正文(≈75)【亮】；
             # 正文里的表情会拉高饱和度 → 用 sat/h 双保险排除
@@ -207,7 +259,7 @@ def process(path, outdir, suffix="_masked", debug=False):
     else:
         hy0, hy1 = int(0.060 * H), int(0.102 * H)
         white = ImageChops.darker(mx.point(lut(180)), sat.point(lut(60, gt=False)))
-    hx0, hx1 = int(0.15 * W), int(0.90 * W)
+    hx0, hx1 = int(0.19 * W), int(0.90 * W)   # 0.19W 起：避开左侧返回键/未读角标
     rp = row_profile(white, (hx0, hy0, hx1, hy1))
     rows = [i for i, v in enumerate(rp) if v > 3]
     # 把连续的行分组：丢掉紧贴窗口顶部的一段（亮色主题里是状态栏药丸的底边），
@@ -229,6 +281,17 @@ def process(path, outdir, suffix="_masked", debug=False):
             box = (hx0 + cols[0] - 8, ryy0 - 6, hx0 + cols[-1] + 9, ryy1 + 7)
             jobs.append((box, "title"))
             print(f"  标题打码 box={box}")
+
+    # ---------- 4) 额外指定的打码框（--extra，特殊版式用，如微信聊天记录卡片名称前缀） ----------
+    if extra:
+        for part in extra.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            nums = [int(v) for v in part.split(",")]
+            if len(nums) == 4:
+                jobs.append((tuple(nums), "text"))
+                print(f"  额外打码框 {tuple(nums)}")
 
     # ---------- 打码 ----------
     for box, kind in jobs:
@@ -257,7 +320,8 @@ if __name__ == "__main__":
     ap.add_argument("--outdir", default="out")
     ap.add_argument("--suffix", default="_masked")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--extra", default="", help="额外打码框: x0,y0,x1,y1;x0,y0,x1,y1")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
     for p in args.images:
-        process(p, args.outdir, args.suffix, args.debug)
+        process(p, args.outdir, args.suffix, args.debug, args.extra)
