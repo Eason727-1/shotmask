@@ -163,10 +163,10 @@ def process(path, outdir, suffix="_masked", debug=False, extra=""):
         if not (0.045 * W <= wd <= 0.22 * W):
             print(f"  [跳过候选] y=({yy0},{yy1}) x=({cx0},{cx1}) w={wd}")
             continue
-        hh = yy1 - yy0 + 1
-        # 头像应近似正方形：排除"383"角标（宽扁）和输入栏图标（窄长）
-        if not (0.72 <= wd / hh <= 1.40):
-            print(f"  [跳过候选] y=({yy0},{yy1}) {wd}x{hh} 长宽比不符")
+        # 头像应贴着竖带左侧边缘（"383"角标、输入栏图标等都离得很远）；
+        # 用贴边而不是长宽比：被截短的头像（如顶部半截 123x60）也要能救回来
+        if b0 > int(0.02 * W):
+            print(f"  [跳过候选] y=({yy0},{yy1}) x=({cx0},{cx1}) 离竖带边缘过远")
             continue
         avatars.append((cx0, yy0, cx1, yy1))
         jobs.append(((cx0 - 3, yy0 - 3, cx1 + 3, yy1 + 3), "avatar"))
